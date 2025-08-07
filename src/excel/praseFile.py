@@ -3,7 +3,6 @@ import pandas as pd
 import os
 import sys
 import json
-import xml.etree.ElementTree as ET
 
 # 确保控制台能正确显示中文
 try:
@@ -22,6 +21,11 @@ MODEL_MAPPING = {
 }
 
 
+def is_blank_row(row):
+    """判断一行是否为空行"""
+    return all(pd.isna(cell) or str(cell).strip() == "" for cell in row)
+
+
 def process_excel(file_path):
     try:
         file_name = os.path.basename(file_path)
@@ -37,72 +41,191 @@ def process_excel(file_path):
         else:  # .xls格式
             engine = 'xlrd'  # xls格式使用xlrd
 
-        # 尝试读取Sheet1
+        # 读取Sheet2，不跳过任何行，不设置表头
         try:
-            df_sheet1 = pd.read_excel(file_path, sheet_name='Sheet1', header=0, engine=engine)
-            print(f"Sheet1 共{len(df_sheet1)}行数据")
-        except Exception as e:
-            print(f"读取Sheet1时出错: {str(e)}")
-            return None
-
-        # 提取Sheet1中的公共属性
-        sheet1_common = df_sheet1.iloc[0] if len(df_sheet1) > 0 else None
-
-        # 读取Sheet2
-        try:
-            df_sheet2 = pd.read_excel(file_path, sheet_name='Sheet2', skiprows=3, header=0, engine=engine)
-            print(f"Sheet2 共{len(df_sheet2)}行数据（从第5行开始）")
+            df_sheet2 = pd.read_excel(file_path, sheet_name='Sheet2', header=None, engine=engine)
+            print(f"Sheet2 共{len(df_sheet2)}行数据")
         except Exception as e:
             print(f"读取Sheet2时出错: {str(e)}")
             return None
 
-        # 获取Sheet2的列数
-        sheet2_columns_count = len(df_sheet2.columns)
-
         # 存储转换后的结果
         result = []
 
-        # 处理Sheet2中的每一行数据
-        for sheet2_idx, sheet2_row in df_sheet2.iterrows():
-            # 获取原始model值并转换
-            original_model = str(sheet1_common.iloc[10]) if (
-                    sheet1_common is not None and pd.notna(sheet1_common.iloc[10])) else ""
-            converted_model = MODEL_MAPPING.get(original_model, original_model)
+        # 解析状态变量
+        # 状态: initial(初始), found_blank(发现空白行), found_general_title(发现通用标题行),
+        #       found_general_data(发现通用数据行), found_specific_title(发现具体标题行), processing_data(处理数据)
+        current_state = "initial"
+        current_general_data = {}  # 存储当前表格的通用数据
+        current_specific_headers = []  # 存储当前表格的具体数据标题
+        table_count = 0  # 统计发现的表格数量
+        general_titles = []  # 存储通用数据的标题行
 
-            # 构建JSON对象
-            json_obj = {
-                "targetId": str(sheet1_common.iloc[2]) if (
-                        sheet1_common is not None and pd.notna(sheet1_common.iloc[2])) else "",
-                "model": converted_model,
-                "dataSource": 5,
-                "droneType": 4,
-                "groundSpeed": float(sheet2_row.iloc[6]) if pd.notna(sheet2_row.iloc[6]) else None,
-                "longitude": float(sheet2_row.iloc[3]) if pd.notna(sheet2_row.iloc[3]) else None,
-                "latitude": float(sheet2_row.iloc[4]) if pd.notna(sheet2_row.iloc[4]) else None,
-                "altitude": float(sheet2_row.iloc[5]) if pd.notna(sheet2_row.iloc[5]) else None,
-                "azimuth": float(sheet2_row.iloc[7]) if pd.notna(sheet2_row.iloc[7]) else None,
-                "createTime": str(sheet2_row.iloc[0]) if pd.notna(sheet2_row.iloc[0]) else "",
-                "pilotLongitude": float(sheet2_row.iloc[10]) if pd.notna(sheet2_row.iloc[10]) else None,
-                "pilotLatitude": float(sheet2_row.iloc[11]) if pd.notna(sheet2_row.iloc[11]) else None,
-                "frequency": str(sheet2_row.iloc[sheet2_columns_count - 5]) if pd.notna(
-                    sheet2_row.iloc[sheet2_columns_count - 5]) else "",
-                "deviceCode": str(sheet2_row.iloc[sheet2_columns_count - 2]) if pd.notna(
-                    sheet2_row.iloc[sheet2_columns_count - 2]) else "",
-                "timestamp": str(sheet2_row.iloc[sheet2_columns_count - 1]) if pd.notna(
-                    sheet2_row.iloc[sheet2_columns_count - 1]) else "",
-                "verticalSpeed": "",
-                "heading": None,
-                "pitch": None,
-                "roll": None,
-                "currentFlightStage": "",
-                "currentFlightDuration": "",
-                "coFlag": None,
-                "uasId": "",
-                "cardNum": ""
-            }
+        # 遍历Sheet2的每一行
+        for row_idx, row in df_sheet2.iterrows():
+            # 获取第一列的值用于判断行类型
+            first_col_value = str(row.iloc[0]).strip() if (len(row) > 0 and pd.notna(row.iloc[0])) else ""
+            blank_row = is_blank_row(row)
 
-            result.append(json_obj)
+            # 调试信息，可根据需要开启
+            # print(f"行{row_idx+1} - 状态: {current_state}, 首列值: '{first_col_value}', 空行: {blank_row}")
 
+            # 处理空白行
+            if blank_row:
+                # 空白行是表格的分隔符
+                current_state = "found_blank"
+                # 重置当前表格数据，但不重置结果，以便继续处理下一个表格
+                current_general_data = {}
+                current_specific_headers = []
+                general_titles = []
+                continue
+
+            # 状态机处理逻辑
+            if current_state in ["initial", "found_blank"]:
+                # 寻找通用数据标题行（第一列是"首次发现"）
+                if first_col_value == "首次发现":
+                    # 记录通用数据标题行
+                    general_titles = [str(cell).strip() if pd.notna(cell) else "" for cell in row]
+                    current_state = "found_general_title"
+                    # 记录新表格发现
+                    table_count += 1
+                    print(f"发现第{table_count}个表格 - 行号: {row_idx + 1}")
+
+            elif current_state == "found_general_title":
+                # 处理通用数据数据行（"首次发现"标题行的下一行）
+                # 提取通用数据（根据标题匹配）
+                current_general_data = {"other_general_data": {}}  # 可扩展存储其他通用数据
+
+                # 遍历通用标题，匹配需要的字段
+                for col_idx, title in enumerate(general_titles):
+                    if col_idx >= len(row):
+                        continue
+
+                    cell_value = row.iloc[col_idx]
+                    cell_str = str(cell_value).strip() if pd.notna(cell_value) else ""
+
+                    # 根据标题匹配通用数据字段（移除了frequency的提取）
+                    if title == "ID":
+                        current_general_data["targetId"] = cell_str
+                    elif title == "机型":
+                        current_general_data["model"] = MODEL_MAPPING.get(cell_str, cell_str)
+
+                current_state = "found_general_data"
+                print(f"提取第{table_count}个表格的通用数据 - 行号: {row_idx + 1}")
+
+            elif current_state == "found_general_data":
+                # 寻找具体数据标题行（第一列是"发现时间"）
+                if first_col_value == "发现时间":
+                    current_specific_headers = [str(cell).strip() if pd.notna(cell) else "" for cell in row]
+                    current_state = "found_specific_title"
+                    print(f"提取第{table_count}个表格的具体数据标题 - 行号: {row_idx + 1}")
+
+            elif current_state == "found_specific_title":
+                # 处理具体数据行
+                # 检查是否是有效的数据行（不是空白行且不是新的标题行）
+                if not blank_row and first_col_value not in ["首次发现", "发现时间"]:
+                    json_obj = {
+                        # 通用数据
+                        "targetId": current_general_data.get("targetId", ""),
+                        "model": current_general_data.get("model", ""),
+                        # 固定值
+                        "dataSource": 5,
+                        "droneType": 4,
+                        # 默认空值（新增distance字段）
+                        "groundSpeed": None,
+                        "longitude": None,
+                        "latitude": None,
+                        "altitude": None,
+                        "azimuth": None,
+                        "createTime": "",
+                        "pilotLongitude": None,
+                        "pilotLatitude": None,
+                        "deviceCode": "",
+                        "timestamp": "",
+                        "verticalSpeed": "",
+                        "heading": None,
+                        "pitch": None,
+                        "roll": None,
+                        "currentFlightStage": "",
+                        "currentFlightDuration": "",
+                        "coFlag": None,
+                        "uasId": "",
+                        "cardNum": "",
+                        "distance": None,  # 新增distance字段
+                        "frequency": ""  # frequency改为从具体数据提取
+                    }
+
+                    # createTime 对应具体数据行的第1列（索引0）
+                    if len(row) > 0 and pd.notna(row.iloc[0]):
+                        json_obj["createTime"] = str(row.iloc[0]).strip()
+
+                    # 根据具体数据标题匹配其他数据
+                    for col_idx, header in enumerate(current_specific_headers):
+                        if col_idx >= len(row):
+                            continue
+
+                        cell_value = row.iloc[col_idx]
+                        cell_str = str(cell_value).strip() if pd.notna(cell_value) else ""
+
+                        # 根据表头匹配到对应的字段
+                        if header == "经度":
+                            try:
+                                json_obj["longitude"] = float(cell_str) if cell_str else None
+                            except ValueError:
+                                json_obj["longitude"] = None
+                        elif header == "纬度":
+                            try:
+                                json_obj["latitude"] = float(cell_str) if cell_str else None
+                            except ValueError:
+                                json_obj["latitude"] = None
+                        elif header == "海拔高度":
+                            try:
+                                json_obj["altitude"] = float(cell_str) if cell_str else None
+                            except ValueError:
+                                json_obj["altitude"] = None
+                        elif header == "飞行速度":
+                            try:
+                                json_obj["groundSpeed"] = float(cell_str) if cell_str else None
+                            except ValueError:
+                                json_obj["groundSpeed"] = None
+                        elif header == "方位":
+                            try:
+                                json_obj["azimuth"] = float(cell_str) if cell_str else None
+                            except ValueError:
+                                json_obj["azimuth"] = None
+                        elif header == "飞手经度":
+                            try:
+                                json_obj["pilotLongitude"] = float(cell_str) if cell_str else None
+                            except ValueError:
+                                json_obj["pilotLongitude"] = None
+                        elif header == "飞手纬度":
+                            try:
+                                json_obj["pilotLatitude"] = float(cell_str) if cell_str else None
+                            except ValueError:
+                                json_obj["pilotLatitude"] = None
+                        elif header == "设备ID":
+                            json_obj["deviceCode"] = cell_str
+                        elif header == "时间戳(ms)":
+                            json_obj["timestamp"] = cell_str
+                        elif header == "距离":  # 新增distance字段匹配
+                            try:
+                                json_obj["distance"] = float(cell_str) if cell_str else None
+                            except ValueError:
+                                json_obj["distance"] = None
+                        elif header == "频率(Mhz)":  # frequency改为从具体数据提取
+                            json_obj["frequency"] = cell_str
+
+                    result.append(json_obj)
+                elif first_col_value == "首次发现":
+                    # 遇到新的表格标题行，说明当前表格已结束
+                    table_count += 1
+                    print(f"发现第{table_count}个表格 - 行号: {row_idx + 1}")
+                    # 记录新表格的通用数据标题行
+                    general_titles = [str(cell).strip() if pd.notna(cell) else "" for cell in row]
+                    current_state = "found_general_title"
+                    current_general_data = {}
+
+        print(f"共发现 {table_count} 个表格")
         # 写入JSON文件
         with open(output_json_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
@@ -112,12 +235,6 @@ def process_excel(file_path):
 
         return result
 
-    except ET.ParseError as e:
-        print(f"\n文件 {file_path} 存在XML解析错误（可能损坏）: {str(e)}")
-        print("建议修复方法:")
-        print("1. 尝试用Excel打开文件并另存为新文件")
-        print("2. 将数据复制到新的Excel文件中")
-        return None
     except Exception as e:
         print(f"\n处理文件 {file_path} 时出错: {str(e)}")
         return None
